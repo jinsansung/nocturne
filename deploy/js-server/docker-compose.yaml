@@ -1,0 +1,280 @@
+# Nocturne — js-server shared-edge deployment (whalesound.net)
+# ============================================================
+#
+# Runs Nocturne on a SUBDOMAIN of an apex owned by someone else
+# (noc.whalesound.net) behind the shared js-server Caddy edge, instead of the
+# bundled Caddy from deploy/docker-compose/. See README.md in this directory for
+# the full rationale, the routing request to hand to the js-server ops session,
+# and the operational runbook.
+#
+# Why this file exists (the fix for the earlier subdomain-install failure):
+#   The standard bundle (deploy/docker-compose/docker-compose.yaml) ships its own
+#   Caddy that binds host ports 80/443 and mints wildcard on-demand TLS for
+#   *.{BASE_DOMAIN}. On the js-server droplet the shared Caddy already owns 80/443
+#   and all public routing, so the bundled Caddy cannot start and the install
+#   fails. This stack drops the bundled Caddy entirely: only the YARP gateway is
+#   published — to the shared "js-server_edge" network, by a fixed container name —
+#   and the shared Caddy reverse-proxies noc.whalesound.net to it.
+#
+# Model: SINGLE-TENANT. The whole app lives at the apex host noc.whalesound.net;
+#   Nocturne auto-resolves the sole tenant, so NO per-tenant wildcard DNS/TLS is
+#   needed. Public share links ({token}.share.noc.whalesound.net) are therefore
+#   off by default — enabling them needs a wildcard route (see README).
+#
+# Usage (on the droplet, from /opt/js-noc/):
+#   docker network create js-server_edge 2>/dev/null || true   # owned by js-server; join only
+#   docker volume create nocturne-noc-postgres-data            # persistent, survives re-create
+#   cp .env.example .env && $EDITOR .env                        # fill in secrets + BASE_DOMAIN
+#   docker compose up -d
+#
+# 6-rule contract compliance:
+#   1) joins js-server_edge as external (gateway only)         2) no host-port publish
+#   3) fixed unique container_name per service                 4) routing requested from ops
+#   5) secrets in .env (gitignored); only .env.example committed
+#   6) mem_limit on every service                              + external named data volume
+
+services:
+  nocturne-postgres-server:
+    image: "docker.io/library/postgres:17.6"
+    container_name: nocturne-noc-postgres
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: "scram-sha-256"
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+      POSTGRES_USER: "${POSTGRES_USERNAME}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "nocturne"
+      NOCTURNE_MIGRATOR_PASSWORD: "${POSTGRES_MIGRATOR_PASSWORD}"
+      NOCTURNE_APP_PASSWORD: "${POSTGRES_APP_PASSWORD}"
+      NOCTURNE_WEB_PASSWORD: "${POSTGRES_WEB_PASSWORD}"
+    expose:
+      - "5432"
+    volumes:
+      - type: "volume"
+        target: "/var/lib/postgresql/data"
+        source: "nocturne-postgres-data"
+        read_only: false
+    networks:
+      - "nocturne_internal"
+    configs:
+      - source: nocturne-init
+        target: /docker-entrypoint-initdb.d/00-init.sh
+        mode: 493
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -h 127.0.0.1 -p 5432
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  nocturne-api:
+    image: "${NOCTURNE_API_IMAGE}"
+    container_name: nocturne-noc-api
+    restart: unless-stopped
+    mem_limit: 640m
+    environment:
+      OTEL_DOTNET_EXPERIMENTAL_OTLP_RETRY: "in_memory"
+      # The shared Caddy terminates TLS and forwards X-Forwarded-* — trust them.
+      ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"
+      HTTP_PORTS: "8080"
+      INSTANCE_KEY: "${INSTANCE_KEY}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "${OTEL_EXPORTER_OTLP_PROTOCOL}"
+      ConnectionStrings__nocturne-postgres: "Host=nocturne-postgres-server;Port=5432;Database=nocturne;Username=nocturne_app;Password=${POSTGRES_APP_PASSWORD}"
+      ConnectionStrings__nocturne-postgres-migrator: "Host=nocturne-postgres-server;Port=5432;Database=nocturne;Username=nocturne_migrator;Password=${POSTGRES_MIGRATOR_PASSWORD}"
+      DemoService__Enabled: "false"
+      WEB_URL: "http://nocturne-web:8000"
+      # BASE_DOMAIN is the subdomain this instance lives on (e.g. noc.whalesound.net).
+      # rpId, WebAuthn origin, and tenant resolution are all derived from it.
+      BASE_DOMAIN: "${BASE_DOMAIN}"
+    expose:
+      - "8080"
+    depends_on:
+      nocturne-postgres-server:
+        condition: service_healthy
+    networks:
+      - "nocturne_internal"
+
+  nocturne-web:
+    image: "${NOCTURNE_WEB_IMAGE}"
+    container_name: nocturne-noc-web
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      PORT: "8000"
+      NOCTURNE_API_HTTP: "http://nocturne-api:8080"
+      services__nocturne-api__http__0: "http://nocturne-api:8080"
+      PUBLIC_API_URL: "http://nocturne-api:8080"
+      NOCTURNE_API_URL: "http://nocturne-api:8080"
+      INSTANCE_KEY: "${INSTANCE_KEY}"
+      DISCORD_BOT_TOKEN: "${DISCORD_BOT_TOKEN}"
+      DISCORD_PUBLIC_KEY: "${DISCORD_PUBLIC_KEY}"
+      DISCORD_APPLICATION_ID: "${DISCORD_APPLICATION_ID}"
+      DISCORD_CLIENT_SECRET: "${DISCORD_CLIENT_SECRET}"
+      BASE_DOMAIN: "${BASE_DOMAIN}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      TELEGRAM_WEBHOOK_SECRET_TOKEN: "${TELEGRAM_WEBHOOK_SECRET_TOKEN}"
+      SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
+      SLACK_SIGNING_SECRET: "${SLACK_SIGNING_SECRET}"
+      WHATSAPP_ACCESS_TOKEN: "${WHATSAPP_ACCESS_TOKEN}"
+      WHATSAPP_VERIFY_TOKEN: "${WHATSAPP_VERIFY_TOKEN}"
+      WHATSAPP_APP_SECRET: "${WHATSAPP_APP_SECRET}"
+      WHATSAPP_PHONE_NUMBER_ID: "${WHATSAPP_PHONE_NUMBER_ID}"
+      # SvelteKit CSRF/origin check: the public https origin the shared Caddy serves.
+      ORIGIN: "https://${BASE_DOMAIN}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "${OTEL_EXPORTER_OTLP_PROTOCOL}"
+      NOCTURNE_POSTGRES_URI: "postgresql://nocturne_web:${POSTGRES_WEB_PASSWORD}@nocturne-postgres-server:5432/nocturne"
+    expose:
+      - "8000"
+    depends_on:
+      nocturne-api:
+        condition: "service_started"
+    networks:
+      - "nocturne_internal"
+
+  # YARP gateway — the SINGLE upstream the shared Caddy proxies to. It is the
+  # only service on js-server_edge; it fans requests out to api/web on the
+  # internal network. container_name is fixed so Caddy can target it by name.
+  gateway:
+    image: "mcr.microsoft.com/dotnet/nightly/yarp:2.3-preview"
+    container_name: nocturne-gateway
+    restart: unless-stopped
+    mem_limit: 256m
+    command:
+      - "/app/yarp.dll"
+    entrypoint:
+      - "dotnet"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      REVERSEPROXY__CLUSTERS__cluster_nocturne-web__HTTPREQUEST__ACTIVITYTIMEOUT: "00:05:00"
+      REVERSEPROXY__ROUTES__route0__MATCH__PATH: "/api/auth/oidc/{**catch-all}"
+      REVERSEPROXY__ROUTES__route0__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route0__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route0__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route1__MATCH__PATH: "/api/oauth/{**catch-all}"
+      REVERSEPROXY__ROUTES__route1__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route1__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route1__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route2__MATCH__PATH: "/api/v4/dev-only/{**catch-all}"
+      REVERSEPROXY__ROUTES__route2__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route2__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route2__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route3__MATCH__PATH: "/api/auth/platform-access/{**catch-all}"
+      REVERSEPROXY__ROUTES__route3__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route3__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route3__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route4__MATCH__PATH: "/api/auth/platform-access"
+      REVERSEPROXY__ROUTES__route4__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route4__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route4__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route5__MATCH__PATH: "/api/{**catch-all}"
+      REVERSEPROXY__ROUTES__route5__CLUSTERID: "cluster_nocturne-web"
+      REVERSEPROXY__ROUTES__route5__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route5__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route6__MATCH__PATH: "/auth/bot/{**catch-all}"
+      REVERSEPROXY__ROUTES__route6__CLUSTERID: "cluster_nocturne-web"
+      REVERSEPROXY__ROUTES__route6__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route6__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route7__MATCH__PATH: "/scalar"
+      REVERSEPROXY__ROUTES__route7__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route7__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route7__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route8__MATCH__PATH: "/scalar/{**catch-all}"
+      REVERSEPROXY__ROUTES__route8__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route8__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route8__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route9__MATCH__PATH: "/openapi/{**catch-all}"
+      REVERSEPROXY__ROUTES__route9__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route9__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route9__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route10__MATCH__PATH: "/.well-known/{**catch-all}"
+      REVERSEPROXY__ROUTES__route10__CLUSTERID: "cluster_nocturne-api"
+      REVERSEPROXY__ROUTES__route10__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route10__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__ROUTES__route11__MATCH__PATH: "/{**catchall}"
+      REVERSEPROXY__ROUTES__route11__CLUSTERID: "cluster_nocturne-web"
+      REVERSEPROXY__ROUTES__route11__TRANSFORMS__0__X-Forwarded: "Off"
+      REVERSEPROXY__ROUTES__route11__TRANSFORMS__0__HeaderPrefix: "X-Forwarded-"
+      REVERSEPROXY__CLUSTERS__cluster_nocturne-api__DESTINATIONS__destination1__ADDRESS: "http://nocturne-api:8080"
+      REVERSEPROXY__CLUSTERS__cluster_nocturne-web__DESTINATIONS__destination1__ADDRESS: "http://nocturne-web:8000"
+      NOCTURNE_API_HTTP: "http://nocturne-api:8080"
+      services__nocturne-api__http__0: "http://nocturne-api:8080"
+      NOCTURNE_WEB_HTTP: "http://nocturne-web:8000"
+      services__nocturne-web__http__0: "http://nocturne-web:8000"
+    expose:
+      - "5000"
+    depends_on:
+      nocturne-api:
+        condition: "service_started"
+      nocturne-web:
+        condition: "service_started"
+    networks:
+      # Internal: reach api/web. Edge: the shared Caddy proxies to nocturne-gateway:5000.
+      - "nocturne_internal"
+      - "js-server_edge"
+
+networks:
+  nocturne_internal:
+    driver: "bridge"
+  js-server_edge:
+    external: true
+    name: js-server_edge
+
+volumes:
+  # External + fixed name so data survives `docker compose down` / re-create.
+  # Pre-create once: docker volume create nocturne-noc-postgres-data
+  nocturne-postgres-data:
+    external: true
+    name: nocturne-noc-postgres-data
+
+configs:
+  nocturne-init:
+    content: |
+      #!/bin/bash
+      # Nocturne PostgreSQL init script (container bootstrap)
+      # =====================================================
+      #
+      # Runs automatically on first container start (fresh data dir) via the
+      # standard /docker-entrypoint-initdb.d/ mechanism. Creates the
+      # nocturne_migrator, nocturne_app and nocturne_web roles Nocturne requires.
+      # Not idempotent by design — it only runs against an empty data directory.
+
+      set -euo pipefail
+
+      : "$${POSTGRES_DB:?POSTGRES_DB must be set}"
+      : "$${POSTGRES_USER:?POSTGRES_USER must be set}"
+      : "$${NOCTURNE_MIGRATOR_PASSWORD:?NOCTURNE_MIGRATOR_PASSWORD must be set}"
+      : "$${NOCTURNE_APP_PASSWORD:?NOCTURNE_APP_PASSWORD must be set}"
+      : "$${NOCTURNE_WEB_PASSWORD:?NOCTURNE_WEB_PASSWORD must be set}"
+
+      psql \
+          --username "$$POSTGRES_USER" \
+          --dbname "$$POSTGRES_DB" \
+          --set ON_ERROR_STOP=on \
+          --set DBNAME="$$POSTGRES_DB" \
+          --set migrator_password="$$NOCTURNE_MIGRATOR_PASSWORD" \
+          --set app_password="$$NOCTURNE_APP_PASSWORD" \
+          --set web_password="$$NOCTURNE_WEB_PASSWORD" \
+          <<'SQL'
+      CREATE ROLE nocturne_migrator LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD :'migrator_password';
+      CREATE ROLE nocturne_app      LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD :'app_password';
+      CREATE ROLE nocturne_web      LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD :'web_password';
+
+      ALTER DATABASE :"DBNAME" OWNER TO nocturne_migrator;
+      ALTER SCHEMA public OWNER TO nocturne_migrator;
+
+      GRANT CONNECT ON DATABASE :"DBNAME" TO nocturne_app;
+      GRANT USAGE ON SCHEMA public TO nocturne_app;
+
+      GRANT CONNECT ON DATABASE :"DBNAME" TO nocturne_web;
+      GRANT USAGE, CREATE ON SCHEMA public TO nocturne_web;
+
+      ALTER DEFAULT PRIVILEGES FOR ROLE nocturne_migrator IN SCHEMA public
+          GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO nocturne_app;
+      ALTER DEFAULT PRIVILEGES FOR ROLE nocturne_migrator IN SCHEMA public
+          GRANT USAGE, SELECT ON SEQUENCES TO nocturne_app;
+      SQL
