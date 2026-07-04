@@ -98,6 +98,19 @@ docker compose up -d
 > **`/setup`에서 안 벗어난다면** (upstream #368): `BASE_DOMAIN`이 실제 서빙 호스트
 > (`noc.whalesound.net`)와 정확히 일치하는지, 그리고 컨테이너에 실제로 주입됐는지
 > 확인하세요. `BASE_DOMAIN` 오설정/미설정은 설정을 마쳐도 `/setup` 루프를 유발합니다.
+>
+> **로그인 화면은 뜨는데 로그인만 계속 실패한다면** (지난 서브도메인 설치 실패의 실제
+> 증상): 거의 항상 **`BASE_DOMAIN`을 apex로 잘못 넣어서** 생기는 SvelteKit CSRF 403입니다.
+> `ORIGIN`이 `https://${BASE_DOMAIN}`로 만들어지므로, `BASE_DOMAIN=whalesound.net`(apex)로
+> 두고 앱을 `noc.whalesound.net`에서 서빙하면 서버 오리진(`https://whalesound.net`)과
+> 브라우저 오리진(`https://noc.whalesound.net`)이 어긋나 로그인 POST가 매번
+> *"Cross-site POST form submissions are forbidden"*(403)로 거부됩니다. 로그인 GET은
+> 멀쩡히 뜨지만 제출만 실패하는 게 특징입니다. 같은 오설정은 테넌트 해석도 깨뜨려(`noc`을
+> 없는 테넌트 슬러그로 인식) API가 404를 냅니다.
+> **해결: `BASE_DOMAIN`을 최상위 도메인이 아니라 "실제로 서빙되는 그 주소"(여기선
+> `noc.whalesound.net`)로 설정하세요.** 이 `.env.example`에는 이미 그렇게 박혀 있습니다.
+> 추가로, 공유 Caddy가 `X-Forwarded-Proto: https`와 원본 `Host`(또는 `X-Forwarded-Host`)를
+> 전달하는지 확인하세요(누락 시 secure 쿠키가 붙지 않아 로그인 후 세션이 안 유지됩니다).
 
 ## 라우팅 요청서 — js-server 서버운영 세션에 전달
 
