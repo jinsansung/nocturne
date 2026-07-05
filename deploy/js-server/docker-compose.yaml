@@ -33,6 +33,12 @@
 #   5) secrets in .env (gitignored); only .env.example committed
 #   6) mem_limit on every service                              + external named data volume
 
+# Pin the compose project name. Without this it defaults to the working-directory
+# basename, so running straight from the repo path (deploy/js-server/) would name
+# the project "js-server" — colliding with the shared edge stack's namespace.
+# Fixed here so it holds regardless of where the stack is deployed from.
+name: nocturne-noc
+
 services:
   nocturne-postgres-server:
     image: "docker.io/library/postgres:17.6"
@@ -141,7 +147,7 @@ services:
   # internal network. container_name is fixed so Caddy can target it by name.
   gateway:
     image: "mcr.microsoft.com/dotnet/nightly/yarp:2.3-preview"
-    container_name: nocturne-gateway
+    container_name: nocturne-noc-gateway
     restart: unless-stopped
     mem_limit: 256m
     command:
@@ -213,7 +219,7 @@ services:
       nocturne-web:
         condition: "service_started"
     networks:
-      # Internal: reach api/web. Edge: the shared Caddy proxies to nocturne-gateway:5000.
+      # Internal: reach api/web. Edge: the shared Caddy proxies to nocturne-noc-gateway:5000.
       - "nocturne_internal"
       - "js-server_edge"
 

@@ -39,7 +39,7 @@ js-server 드롭릿에서는 이 전제가 성립하지 않습니다. **공유 C
 | 공개 앱 | `https://noc.whalesound.net` (단일 테넌트, apex 자동 해석) |
 | 번들 Caddy | **제거** — 공유 js-server Caddy가 TLS 종료 |
 | 호스트 포트 publish | **없음** — 게이트웨이는 `js-server_edge`로만 접근 |
-| 엣지 업스트림 | `nocturne-gateway:5000` (고정 `container_name`) |
+| 엣지 업스트림 | `nocturne-noc-gateway:5000` (고정 `container_name`) |
 | 영속성 | external + 고정 이름 볼륨 `nocturne-noc-postgres-data` |
 | 테넌트별 서브도메인 (`*.noc…`) | **꺼짐** (단일 테넌트) — 켜려면 와일드카드 route 필요 |
 | 공개 공유 링크 (`{token}.share.noc…`) | **꺼짐** — 아래 "공개 공유 링크 활성화" 참조 |
@@ -71,10 +71,20 @@ js-server 드롭릿에서는 이 전제가 성립하지 않습니다. **공유 C
 **멀티테넌트/공유 링크만이 와일드카드**를 요구합니다. 이 스택은 정확히 그 지지되는
 경로를 따릅니다.
 
+## 사전 요구사항 (배포 전)
+
+- **DNS:** Cloudflare에 `noc.whalesound.net` A 레코드를 드롭릿 IP(152.42.227.146)로,
+  **회색구름(DNS-only)** 으로 생성. 공유 Caddy가 Let's Encrypt로 인증서를 발급하고
+  라우팅하려면 이 레코드가 먼저 있어야 합니다. (호스트 정보상 apex도 회색구름 규칙.)
+- **js-server_edge 네트워크:** 공유 Caddy가 소유하며 **보통 이미 존재**합니다(우리는
+  조인만). 아래 `docker network create`는 없을 때를 대비한 멱등 폴백일 뿐이며, 서버운영
+  세션에 이미 있는지 확인하는 편이 안전합니다(속성을 새로 만들면 안 됨).
+
 ## 배포 (드롭릿, `/opt/js-noc/`에서)
 
 ```bash
-# 1. 공유 엣지 네트워크 조인 (js-server 소유; 우리는 조인만)
+# 1. 공유 엣지 네트워크는 js-server 소유 — 조인만 한다.
+#    (아래는 "없으면 만든다" 폴백; 이미 있으면 no-op)
 docker network create js-server_edge 2>/dev/null || true
 
 # 2. 영속 데이터 볼륨 1회 생성 (compose down / 재생성에도 데이터 보존)
@@ -83,7 +93,8 @@ docker volume create nocturne-noc-postgres-data
 # 3. 시크릿
 cp .env.example .env
 #   BASE_DOMAIN=noc.whalesound.net 설정, INSTANCE_KEY + POSTGRES_* 4개 채우기.
-#   각 값 생성:  openssl rand -base64 32
+#   시크릿은 URI-안전 생성기로:  openssl rand -hex 32
+#   (plain `-base64 32`의 '/'·'+'는 nocturne_web의 Postgres URI를 깨뜨림 — .env.example 참고)
 
 # 4. 기동
 docker compose up -d
@@ -100,34 +111,46 @@ docker compose up -d
 > 확인하세요. `BASE_DOMAIN` 오설정/미설정은 설정을 마쳐도 `/setup` 루프를 유발합니다.
 >
 > **로그인 화면은 뜨는데 로그인만 계속 실패한다면** (지난 서브도메인 설치 실패의 실제
-> 증상): 거의 항상 **`BASE_DOMAIN`을 apex로 잘못 넣어서** 생기는 SvelteKit CSRF 403입니다.
-> `ORIGIN`이 `https://${BASE_DOMAIN}`로 만들어지므로, `BASE_DOMAIN=whalesound.net`(apex)로
-> 두고 앱을 `noc.whalesound.net`에서 서빙하면 서버 오리진(`https://whalesound.net`)과
-> 브라우저 오리진(`https://noc.whalesound.net`)이 어긋나 로그인 POST가 매번
-> *"Cross-site POST form submissions are forbidden"*(403)로 거부됩니다. 로그인 GET은
-> 멀쩡히 뜨지만 제출만 실패하는 게 특징입니다. 같은 오설정은 테넌트 해석도 깨뜨려(`noc`을
-> 없는 테넌트 슬러그로 인식) API가 404를 냅니다.
-> **해결: `BASE_DOMAIN`을 최상위 도메인이 아니라 "실제로 서빙되는 그 주소"(여기선
-> `noc.whalesound.net`)로 설정하세요.** 이 `.env.example`에는 이미 그렇게 박혀 있습니다.
-> 추가로, 공유 Caddy가 `X-Forwarded-Proto: https`와 원본 `Host`(또는 `X-Forwarded-Host`)를
-> 전달하는지 확인하세요(누락 시 secure 쿠키가 붙지 않아 로그인 후 세션이 안 유지됩니다).
+> 증상): 근본 원인은 **`BASE_DOMAIN`을 apex로 잘못 넣은 것**입니다. `ORIGIN`이
+> `https://${BASE_DOMAIN}`로 만들어지므로, `BASE_DOMAIN=whalesound.net`(apex)로 두고 앱을
+> `noc.whalesound.net`에서 서빙하면 서버 오리진(`https://whalesound.net`)과 브라우저
+> 오리진(`https://noc.whalesound.net`)이 어긋납니다. 로그인 제출은 SvelteKit **remote
+> function(POST)** 이라 이 오리진 불일치로 거부되고(오리진 검사 실패; 정확한 에러 문자열은
+> form 제출용 *"Cross-site POST form submissions are forbidden"* 과 다를 수 있음, upstream
+> #100 참고), 로그인 GET은 멀쩡히 뜨지만 제출만 실패하는 게 특징입니다.
+> 같은 apex 오설정은 **한 번에 세 가지**를 동시에 깨뜨립니다: (a) 위 오리진(CSRF) 거부,
+> (b) WebAuthn origin 불일치로 패스키 세리머니 실패 가능, (c) `SubdomainParser`가 `noc`을
+> 없는 테넌트 슬러그로 인식해 API 404. 그래서 증상이 404와 섞여 보일 수 있습니다.
+> **해결(셋 다 한 번에): `BASE_DOMAIN`을 최상위 도메인이 아니라 "실제로 서빙되는 그
+> 주소"(여기선 `noc.whalesound.net`)로 설정하세요.** 이 `.env.example`에는 이미 그렇게
+> 박혀 있습니다. 추가로, 공유 Caddy가 `X-Forwarded-Proto: https`와 원본 `Host`(또는
+> `X-Forwarded-Host`)를 전달하는지 확인하세요(누락 시 secure 쿠키가 붙지 않아 로그인 후
+> 세션이 안 유지되는, 진단이 까다로운 별개 증상이 납니다).
+>
+> **단일 테넌트 불변조건(중요):** 이 설치는 apex 자동 해석에 의존하며, **활성 테넌트가
+> 정확히 1개**일 때만 `noc.whalesound.net`에서 동작합니다. 운영 중 **두 번째 테넌트나 데모
+> 테넌트를 만들면** apex가 어느 테넌트인지 결정하지 못해 즉시 404가 되고 접근이 끊깁니다
+> (`compose`는 `DemoService__Enabled=false`로 데모를 막아둠). 여러 테넌트가 필요하면
+> 단일 호스트 모델을 벗어나 아래 와일드카드 경로가 필요합니다. 또, 최초 설치 직후 테넌트를
+> 만들면 테넌트 캐시(약 5분) 때문에 잠깐 503/404가 남을 수 있습니다 — 몇 분 뒤 정상화.
 
 ## 라우팅 요청서 — js-server 서버운영 세션에 전달
 
 > "신규 스택 → 서버운영" 템플릿을 채운 것:
 >
 > 1. **원하는 서브도메인 슬러그:** `noc` → `noc.whalesound.net` *(noc은 드롭됨, 재사용 가능)*
-> 2. **업스트림:** `nocturne-gateway:5000`
+> 2. **업스트림:** `nocturne-noc-gateway:5000`
 > 3. **업스트림 프로토콜:** `http` (평문; TLS는 공유 Caddy에서 종료)
 > 4. **프록시 특이사항:**
->    - **WebSocket + SSE 필요** — SignalR 허브(알림, 실시간 위젯)는 WebSocket을,
->      실시간 스트림은 SSE를 씁니다. `flush_interval -1` + WebSocket 업그레이드 활성화.
+>    - **WebSocket 필요** — SignalR 허브(알림, 실시간 위젯)가 WebSocket을 씁니다.
+>      WebSocket 업그레이드를 허용하고, SignalR이 SSE 폴백 전송으로 협상될 수 있으니
+>      프록시가 스트림을 버퍼링하지 않도록 `flush_interval -1`도 켜 두세요(무해).
 >      게이트웨이의 web 클러스터에는 이미 5분 activity timeout이 설정돼 있습니다.
 >    - 원본 **Host**와 **X-Forwarded-*** (Proto/Host)를 전달할 것 — 앱이 이를 신뢰합니다
 >      (`ASPNETCORE_FORWARDEDHEADERS_ENABLED=true`, SvelteKit `ORIGIN=https://noc.whalesound.net`).
 >    - 대용량 업로드 경로 없음; 기본 바디 크기 제한으로 충분.
 > 5. **공개 여부:** 공개 (Caddy route).
-> 6. **js-server_edge 조인 확인:** 예 — `nocturne-gateway`가 `js-server_edge`에 조인.
+> 6. **js-server_edge 조인 확인:** 예 — `nocturne-noc-gateway`가 `js-server_edge`에 조인.
 > 7. **메모리(mem_limit, 매니페스트 기록용):** postgres 512m · api 640m · web 512m ·
 >    gateway 256m (합계 ≈ **1.9 GB** 상한).
 > 8. **스택 성격:** 코드 스택(자체 레포: `jinsansung/nocturne`), 이미지는
@@ -137,27 +160,34 @@ docker compose up -d
 
 ```caddy
 noc.whalesound.net {
-    reverse_proxy nocturne-gateway:5000
+    reverse_proxy nocturne-noc-gateway:5000
 }
 ```
 
 (Caddy는 WebSocket을 자동 처리합니다. SSE가 버퍼링되면 `flush_interval -1` 추가.)
 
-## 공개 공유 링크 활성화 (선택, 나중에)
+## 공개 공유 링크 활성화 (선택, 미검증 — 그대로 따라 하지 말 것)
 
 공유 링크는 `{token}.share.noc.whalesound.net`에서 서빙됩니다 — 무한한 호스트 집합입니다.
-켜려면 **공유 Caddy** 쪽에 다음이 필요합니다.
+이 스택 범위 밖이며, **아래는 검증되지 않은 방향성 메모**입니다.
+
+> ⚠️ **중요 정정:** `on_demand_tls { ask …/api/v4/platform/tls-authorize }` 방식은 공유
+> 호스트에 **그대로 쓸 수 없습니다.** 그 인가 엔드포인트(`TlsAuthorizationController`)는
+> **apex와 "활성 테넌트 서브도메인"만** 200으로 승인하고, `{token}.share.…` 형태는
+> `SubdomainParser`가 `{token}.share`를 테넌트 슬러그로 넘겨 매칭 실패 → **404**를 냅니다.
+> 즉 on-demand ask 게이트에 물리면 Caddy가 공유 호스트 인증서를 **영영 발급하지 못합니다.**
+
+따라서 공유 링크를 켜려면 on-demand ask가 아니라 **와일드카드 인증서** 전략이 필요합니다.
 
 - `*.share.noc.whalesound.net` (멀티테넌트 서브도메인까지 원하면 `*.noc.whalesound.net`도)
-  와일드카드 route → `nocturne-gateway:5000`,
-- 실제 호스트에만 인증서를 발급하도록 Nocturne 인가로 게이트한 on-demand TLS:
-  `on_demand_tls { ask http://nocturne-api:8080/api/v4/platform/tls-authorize }`
-  (이때 `nocturne-noc-api` 컨테이너도 `js-server_edge`에 조인해야 함),
-- Cloudflare DNS에 `*.share.noc` (및 `*.noc`) **회색구름(DNS-only)** A 레코드.
+  와일드카드 route → `nocturne-noc-gateway:5000`,
+- 그 와일드카드에 대한 **DNS-01 와일드카드 인증서**(Cloudflare API 토큰 필요) — HTTP-01은
+  와일드카드를 발급할 수 없습니다,
+- Cloudflare DNS에 `*.share.noc` (및 `*.noc`) **회색구름(DNS-only)** 레코드.
 
-HTTP-01은 와일드카드를 발급할 수 없으므로, 단일 와일드카드 인증서가 아니라 Caddy의
-**호스트별** on-demand 발급에 의존합니다(upstream #292의 결론과 동일). 이는 공유 Caddy
-설정 변경이므로 서버운영 세션에 요청하세요. 이 스택 범위 밖입니다.
+이는 공유 Caddy의 인증서 발급 방식과 DNS 자격증명을 건드리는 변경이므로, 실제로 원할 때
+서버운영 세션과 **별도로 설계·검증**하세요. (참고: 스톡 번들의 `tls-authorize` on-demand
+경로도 apex + 테넌트 서브도메인만 커버하며 공유 호스트를 커버하지 않습니다.)
 
 ## 업데이트
 
