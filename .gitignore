@@ -60,6 +60,8 @@ docs/seed/dev-snapshot.json
 docker-compose.yaml
 !deploy/portainer/docker-compose.yaml
 !deploy/docker-compose/docker-compose.yaml
+# Hand-authored shared-edge stack for the js-server droplet (not generated).
+!deploy/js-server/docker-compose.yaml
 !.env.example
 
 # Git worktrees
