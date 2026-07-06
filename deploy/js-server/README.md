@@ -189,13 +189,55 @@ noc.whalesound.net {
 서버운영 세션과 **별도로 설계·검증**하세요. (참고: 스톡 번들의 `tls-authorize` on-demand
 경로도 apex + 테넌트 서브도메인만 커버하며 공유 호스트를 커버하지 않습니다.)
 
-## 업데이트
+## 업그레이드 / 판올림 시 주의사항
 
-이미지는 `:latest`로 고정돼 있습니다. 업데이트:
+간단 업데이트:
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-(여기엔 Watchtower를 넣지 않았습니다 — 이미지 갱신은 js-server가 표준화하는 방식에
-맡깁니다. upstream #292의 "이중 업데이터 금지" 권고와 동일.)
+여기엔 Watchtower를 넣지 않았습니다(upstream #292의 "이중 업데이터 금지"와 동일 —
+이미지 갱신은 js-server 표준 방식에 맡김).
+
+### 드리프트 주의 — 이 파일은 upstream 번들의 "손으로 파생한 사본"
+
+이 `docker-compose.yaml`은 upstream 생성 번들(`deploy/docker-compose/`, `scripts/
+publish-release.cs`가 Aspire AppHost에서 생성)에서 **손으로 옮겨 온** 파일입니다. 서비스
+정의·게이트웨이 라우트 테이블·환경변수·postgres init SQL을 그 번들과 문자 그대로 맞춰
+두었지만 **자동 동기화되지 않습니다.** 판올림 시 위험은 이 드리프트이지, 이 스택에 가한
+하드닝(프로젝트명 고정·컨테이너명·hex 비번)이 아닙니다.
+
+- **DB 스키마 마이그레이션은 자동**입니다(API 기동 시 migrator 역할이 실행) → 판올림에
+  별도 조치 불필요.
+- **`:latest`는 "고정"이 아닙니다.** `pull`이 예고 없이 상위 버전을 당길 수 있으므로,
+  공유 드롭릿에서는 **릴리스 태그로 고정**하고 의도적으로 올리길 권장:
+  ```
+  NOCTURNE_API_IMAGE=ghcr.io/nightscout/nocturne/nocturne-api:vX.Y.Z
+  NOCTURNE_WEB_IMAGE=ghcr.io/nightscout/nocturne/nocturne-web:vX.Y.Z
+  ```
+- **`container_name`·`js-server_edge`는 서버운영 세션과의 계약**입니다. 판올림 중에 이
+  이름/네트워크를 바꾸면 공유 Caddy 라우트(`nocturne-noc-gateway:5000`)도 함께 갱신해야
+  합니다. 되도록 유지하세요.
+
+### 판올림 전 체크리스트
+
+대상 릴리스의 upstream 번들(`deploy/docker-compose/docker-compose.yaml` 또는 portainer
+번들)과 이 파일을 대조해, 아래가 바뀌었으면 이 파일에 반영한 뒤 배포하세요.
+
+1. **환경변수** (api·web 서비스): 새/변경/삭제된 키 — 누락 시 기동 실패·오동작.
+2. **게이트웨이 라우트 테이블**(`REVERSEPROXY__ROUTES__*`): 새 경로 프리픽스가 api/web로
+   라우팅돼야 하는데 빠지면 404·오라우팅.
+3. **새 서비스**: 예컨대 실시간 bridge/worker/redis 등이 별도 컨테이너로 분리됐는지 —
+   빠지면 해당 기능(실시간 등)이 조용히 깨짐. (현재 토폴로지는 upstream과 동일: postgres·
+   api·web·gateway. 실시간 bridge는 web 이미지 안에서 돎.)
+4. **postgres 이미지 메이저 버전** 상승: 데이터 볼륨 `pg_upgrade` 필요 가능(현재 17.6 고정).
+5. **DB init SQL / 역할**(`nocturne_migrator`/`app`/`web`) 변경.
+
+빠른 대조:
+```bash
+# 저장소에서, 두 파일의 env 키만 뽑아 비교
+git show <릴리스태그>:deploy/docker-compose/docker-compose.yaml > /tmp/up.yaml
+diff <(grep -oE '^[[:space:]]+[A-Z0-9_]+:' /tmp/up.yaml | sort -u) \
+     <(grep -oE '^[[:space:]]+[A-Z0-9_]+:' deploy/js-server/docker-compose.yaml | sort -u)
+```
